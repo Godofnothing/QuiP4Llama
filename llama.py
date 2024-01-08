@@ -114,14 +114,11 @@ def llama_sequential(model, dataloader, dev, args):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         for h in handles:
             h.remove()
-        # (H / nsamples).to(torch.float32)
         for name in subset:
             quant_method[name].post_batch()
 
         # Quantize Weights
         for name in subset:
-            # print(i, name)
-            # print('Quantizing ...')
             quant_method[name].preproc(
                 preproc_gptqH=args.pre_gptqH,
                 percdamp=args.percdamp,
@@ -135,7 +132,7 @@ def llama_sequential(model, dataloader, dev, args):
                 quant_method[name].fasterquant(lazy_batch=args.lazy_batch)
             elif args.quant == "nearest":
                 quant_method[name].fasterquant()
-            quantizers["model.decoder.layers.%d.%s" % (i, name)] = quant_method[name].quantizer
+            quantizers["model.layers.%d.%s" % (i, name)] = quant_method[name].quantizer
 
             errors.append(quant_method[name].error)
             times.append(quant_method[name].time)
@@ -159,22 +156,15 @@ def llama_sequential(model, dataloader, dev, args):
 
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev):
-    # print('Evaluating ...')
-
+def llama_eval(odel, testenc, dev, dataset_name):
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.decoder.layers
+    layers = model.model.layers
 
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
-    if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
-    if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
+    model.model.embed_tokens = model.model.embed_tokens.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -202,12 +192,7 @@ def llama_eval(model, testenc, dev):
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-    model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-    if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.cpu()
-    if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.cpu()
+    model.model.embed_tokens = model.model.embed_tokens.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
@@ -224,20 +209,16 @@ def llama_eval(model, testenc, dev):
         torch.cuda.empty_cache()
         inps, outs = outs, inps
 
-    if model.model.decoder.final_layer_norm is not None:
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
-    if model.model.decoder.project_out is not None:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
+    if model.model.norm is not None:
+        model.model.norm = model.model.norm.to(dev)
     model.lm_head = model.lm_head.to(dev)
 
     testenc = testenc.to(dev)
     nlls = []
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
-        if model.model.decoder.final_layer_norm is not None:
-            hidden_states = model.model.decoder.final_layer_norm(hidden_states)
-        if model.model.decoder.project_out is not None:
-            hidden_states = model.model.decoder.project_out(hidden_states)
+        if model.model.norm is not None:
+            hidden_states = model.model.norm(hidden_states)
         lm_logits = model.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][:, 1:]
@@ -246,87 +227,13 @@ def llama_eval(model, testenc, dev):
         neg_log_likelihood = loss.float() * model.seqlen
         nlls.append(neg_log_likelihood)
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-    print(ppl.item())
+    print(f"\n{dataset_name} perplexity = {ppl.item():.4f}\n")
+
+    if args.wandb:
+        wandb.log({dataset_name: ppl.item()})
 
     model.config.use_cache = use_cache
 
-
-# TODO: perform packing on GPU
-def llama_pack3(model, quantizers):
-    layers = find_layers(model)
-    layers = {n: layers[n] for n in quantizers}
-    make_quant3(model, quantizers)
-    qlayers = find_layers(model, [Quant3Linear])
-    print("Packing ...")
-    for name in qlayers:
-        print(name)
-        quantizers[name] = quantizers[name].cpu()
-        qlayers[name].pack(layers[name], quantizers[name].scale, quantizers[name].zero)
-    print("Done.")
-    return model
-
-
-def load_quant3(model, checkpoint):
-    from transformers import OPTConfig, OPTForCausalLM
-
-    config = OPTConfig.from_pretrained(model)
-
-    def noop(*args, **kwargs):
-        pass
-
-    torch.nn.init.kaiming_uniform_ = noop
-    torch.nn.init.uniform_ = noop
-    torch.nn.init.normal_ = noop
-
-    torch.set_default_dtype(torch.half)
-    transformers.modeling_utils._init_weights = False
-    torch.set_default_dtype(torch.half)
-    model = OPTForCausalLM(config)
-    torch.set_default_dtype(torch.float)
-    model = model.eval()
-    layers = find_layers(model)
-    for name in ["model.decoder.project_out", "model.decoder.project_in", "lm_head"]:
-        if name in layers:
-            del layers[name]
-    make_quant3(model, layers)
-
-    print("Loading model ...")
-    model.load_state_dict(torch.load(checkpoint))
-    model.seqlen = model.config.max_position_embeddings
-    print("Done.")
-
-    return model
-
-
-def load_quant(model, checkpoint):
-    from transformers import OPTConfig, OPTForCausalLM
-
-    config = OPTConfig.from_pretrained(model)
-
-    def noop(*args, **kwargs):
-        pass
-
-    torch.nn.init.kaiming_uniform_ = noop
-    torch.nn.init.uniform_ = noop
-    torch.nn.init.normal_ = noop
-
-    torch.set_default_dtype(torch.half)
-    transformers.modeling_utils._init_weights = False
-    torch.set_default_dtype(torch.half)
-    model = OPTForCausalLM(config)
-    torch.set_default_dtype(torch.float)
-    model = model.eval()
-    layers = find_layers(model)
-    for name in ["model.decoder.project_out", "model.decoder.project_in", "lm_head"]:
-        if name in layers:
-            del layers[name]
-
-    print("Loading model ...")
-    model.load_state_dict(torch.load(checkpoint))
-    model.seqlen = model.config.max_position_embeddings
-    print("Done.")
-
-    return model
 
 
 if __name__ == "__main__":
@@ -369,7 +276,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--qfn", type=str, default="a", help="qfn: a is default, b is sym incoherent based")
     parser.add_argument("--save", type=str, default="", help="Save quantized checkpoint under this name.")
-    parser.add_argument("--load", type=str, default="", help="Load quantized model.")
     parser.add_argument(
         "--check", action="store_true", help="Whether to compute perplexity during benchmarking for verification."
     )
@@ -395,38 +301,34 @@ if __name__ == "__main__":
         )
         wandb.run.log_code(".")
 
-    if args.load:
-        model = load_quant(args.model, args.load)
-        model.eval()
-    else:
-        model = get_llama(args.model)
-        model.eval()
+    model = get_llama(args.model)
+    model.eval()
 
-        dataloader, _ = get_loaders(
-            args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
+    dataloader, _ = get_loaders(
+        args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
+    )
+
+    if args.wbits < 16:
+        # Preprocessing flags
+        if args.qfn == "b":
+            assert args.pre_proj is True
+        print(
+            f"Preprocessing flags: gptqH:{args.pre_gptqH}, rescale:{args.pre_rescale}, proj:{args.pre_proj}, proj_extra:{args.pre_proj_extra}, qfn:{args.qfn}"
         )
+        print(f"using lazy_batch updates: {args.lazy_batch}")
+        # LDL checks
+        if ("ldl" in args.quant) and args.unbiased and (args.npasses > 0):
+            print(f"LDL NOTE: unbiased + {args.npasses} npasses. NOT TRULY UNBIASED.")
 
-        if args.wbits < 16:
-            # Preprocessing flags
-            if args.qfn == "b":
-                assert args.pre_proj is True
-            print(
-                f"Preprocessing flags: gptqH:{args.pre_gptqH}, rescale:{args.pre_rescale}, proj:{args.pre_proj}, proj_extra:{args.pre_proj_extra}, qfn:{args.qfn}"
-            )
-            print(f"using lazy_batch updates: {args.lazy_batch}")
-            # LDL checks
-            if ("ldl" in args.quant) and args.unbiased and (args.npasses > 0):
-                print(f"LDL NOTE: unbiased + {args.npasses} npasses. NOT TRULY UNBIASED.")
-
-            tick = time.time()
-            quantizers, errors = llama_sequential(model, dataloader, DEV, args)
-            print(f"Total quant + H time elapsed: {time.time() - tick:.2f}s")
-            print("")
-            print(
-                f"Proxy Summary: Qmethod:{args.quant}, Unbiased: {args.unbiased}, W:{args.wbits}, NPass:{args.npasses}"
-            )
-            print("Quantization done.")
-            print("")
+        tick = time.time()
+        quantizers, errors = llama_sequential(model, dataloader, DEV, args)
+        print(f"Total quant + H time elapsed: {time.time() - tick:.2f}s")
+        print("")
+        print(
+            f"Proxy Summary: Qmethod:{args.quant}, Unbiased: {args.unbiased}, W:{args.wbits}, NPass:{args.npasses}"
+        )
+        print("Quantization done.")
+        print("")
 
     if args.save:
         torch.save(model.state_dict(), args.save)
@@ -435,4 +337,4 @@ if __name__ == "__main__":
         for dataset in ["wikitext2", "ptb-new", "c4-new"]:
             dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
             print(dataset)
-            llama_eval(model, testloader, DEV)
+            llama_eval(model, testloader, DEV, dataset)
