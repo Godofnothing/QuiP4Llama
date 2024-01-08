@@ -17,7 +17,7 @@ def hessian_loss(dw, H):
 
 def calc_entropy(wr_count):
     # empirical distribution of weights into bit patterns
-    wr_dist = wr_counts / wr_counts.sum()
+    wr_dist = wr_count / wr_count.sum()
     print(wr_dist)
     # log(2) = 0.69... to convert from base e to bits
     print("avg bits per weight: %f" %

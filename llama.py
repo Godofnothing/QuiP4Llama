@@ -63,7 +63,9 @@ def llama_sequential(model, dataloader, dev, args):
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(dev))
+            if isinstance(batch, (list, tuple)):
+                batch = batch[0]
+            model(batch.to(dev))
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -235,7 +237,6 @@ def llama_eval(odel, testenc, dev, dataset_name):
     model.config.use_cache = use_cache
 
 
-
 if __name__ == "__main__":
     import argparse
     from datautils import *
@@ -244,7 +245,7 @@ if __name__ == "__main__":
 
     parser.add_argument("model", type=str, help="model to load")
     parser.add_argument(
-        "dataset", type=str, choices=["wikitext2", "ptb", "c4"], help="Where to extract calibration data from."
+        "dataset", type=str, default=None, help="Where to extract calibration data from."
     )
     parser.add_argument("--seed", type=int, default=0, help="Seed for sampling the calibration data.")
     parser.add_argument("--nsamples", type=int, default=128, help="Number of calibration data samples.")
@@ -304,8 +305,12 @@ if __name__ == "__main__":
     model = get_llama(args.model)
     model.eval()
 
-    dataloader, _ = get_loaders(
-        args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
+    dataloader = get_loaders(
+        args.dataset, 
+        nsamples=args.nsamples, 
+        seed=args.seed, 
+        seqlen=model.seqlen,
+        model_path=args.model
     )
 
     if args.wbits < 16:
@@ -335,6 +340,12 @@ if __name__ == "__main__":
 
     if not args.proxy_only:
         for dataset in ["wikitext2", "ptb-new", "c4-new"]:
-            dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
+            testloader = get_loaders(
+                dataset, 
+                seed=args.seed, 
+                seqlen=model.seqlen,
+                eval_mode=True,
+                model_path=args.model
+            )
             print(dataset)
             llama_eval(model, testloader, DEV, dataset)
