@@ -346,6 +346,7 @@ if __name__ == "__main__":
         print("")
 
     if args.save:
+        os.makedirs(os.path.dirname(args.save), exist_ok=True)
         torch.save(model.state_dict(), args.save)
 
     if not args.proxy_only:
