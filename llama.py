@@ -158,8 +158,7 @@ def llama_sequential(model, dataloader, dev, args):
 
 
 @torch.no_grad()
-def llama_eval(odel, testenc, dev, dataset_name):
-    testenc = testenc.input_ids
+def llama_eval(model, testenc, dev, dataset_name):
     nsamples = testenc.numel() // model.seqlen
 
     use_cache = model.config.use_cache
@@ -339,7 +338,7 @@ if __name__ == "__main__":
         torch.save(model.state_dict(), args.save)
 
     if not args.proxy_only:
-        for dataset in ["wikitext2", "ptb-new", "c4-new"]:
+        for dataset in ["wikitext2", "ptb", "c4"]:
             testloader = get_loaders(
                 dataset, 
                 seed=args.seed, 
