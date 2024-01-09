@@ -73,8 +73,10 @@ def llama_sequential(model, dataloader, dev, args):
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     model.model.norm = model.model.norm.cpu()
+    if args.offload_activations:
+        inps = inps.cpu()
     torch.cuda.empty_cache()
-
+    
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
 
@@ -113,7 +115,9 @@ def llama_sequential(model, dataloader, dev, args):
         for name in subset:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(inps[j].to(dev).unsqueeze(0), attention_mask=attention_mask)[0]
+            if args.offload_activations:
+                outs[j] = outs[j].cpu()
         for h in handles:
             h.remove()
         for name in subset:
@@ -142,7 +146,9 @@ def llama_sequential(model, dataloader, dev, args):
             quant_method[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(inps[j].to(dev).unsqueeze(0), attention_mask=attention_mask)[0]
+            if args.offload_activations:
+                outs[j] = outs[j].cpu()
 
         layers[i] = layer.cpu()
         del layer
@@ -283,6 +289,11 @@ if __name__ == "__main__":
     parser.add_argument("--unbiased", action="store_true", help="unbiased")
     parser.add_argument("--incoh_processing", action="store_true", help="incoherence processing")
     parser.add_argument("--lazy_batch", action="store_true", help="lazy batch updates in blocks as used in OPTQ")
+    parser.add_argument(
+        "--offload_activations",
+        action="store_true",
+        help="Offload activations to RAM to save GPU memory.",
+    )
     parser.add_argument("--wandb", action="store_true", help="Whether to use wandb.")
 
     args = parser.parse_args()
